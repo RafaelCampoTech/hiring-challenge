@@ -18,3 +18,9 @@ yarn-error.log
 /.fleet
 /.idea
 /.vscode
+
+# Python
+__pycache__/
+*.py[cod]
+contact_finder/.venv/
+output/results.csv
