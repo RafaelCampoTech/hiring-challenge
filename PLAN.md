@@ -2,17 +2,88 @@
 
 ## Architecture
 
-**Input:** CSV with `company_name` + `mailing_address`.
+**Input:** CSV with `company_name` + `mailing_address`.  
 **Output:** Same rows enriched with `contact_name`, `contact_role`, `contact_email_or_phone`, `confidence_score`, `source`, `needs_human_review`.
 
-An orchestrator agent accepts a row, fans out to N lookup tools (MCP-backed), collects results, merges them, scores confidence, and writes the output row.
+A small ETL step normalizes each incoming row. For every row, an orchestrator agent fans out to a set of lookup tools in parallel — each tool wraps an external API or data source. Results are aggregated, analyzed, scored, and written to the output.
 
-Data flow (per row):
+### Lookup tools (Phase 1 — parallel)
+
+**Tool 1 — Google Maps lookup**  
+Search the mailing address in Google Maps to retrieve any registered phone number, website, Instagram account, or LinkedIn link.
+
+**Tool 2 — Web / Google search**  
+Search the company name and name variations in Google to find any public website. If a website is found, check its data policy; if permitted, crawl the contact page for email addresses or phone numbers.
+
+**Tool 3 — LinkedIn profile resolution**  
+If Tool 1 or Tool 2 surfaces a LinkedIn URL, inspect it to determine the profile type:
+- *Company page found directly* → pass it straight to Tool 4.
+- *Personal profile found first* → use the LinkedIn API to find the company page the person is associated with; run NLP to confirm it matches the target company, then pass that company page to Tool 4.
+
+**Tool 4 — LinkedIn Sales Navigator / API**  
+Using the confirmed LinkedIn company page (from Tool 3), search for people at the company filtered by job title. This enables a semantic search for decision-makers (AP manager, Owner, CFO, office manager). Tool 4 only runs if Tool 3 produced a confirmed company page.
+
+**Tool 5 — Email syntax + MX validation**  
+For any candidate email found, perform a syntax check and an MX-record DNS lookup to confirm the domain accepts mail. No live probe is sent to the mail server.
+
+### Aggregation & NLP analysis
+
+All tool outputs are collected into an intermediate results table — one entry per signal, each carrying a `source_url`. An NLP pass then cross-references signals for additional clues. For example, if an email like `rafael@imtheceo.com` is found, extract the name and run a corroborating search (`"rafael" + "CEO" + company name`) to confirm the identity.
+
+### Phase 2 — Agent evaluation loop
+
+The orchestrator agent reviews the aggregated table and decides whether the data is sufficient to identify a meaningful decision-maker contact. If not, it generates up to **3 hypotheses** for how to find the contact (e.g., "check state business registry", "search for press mentions of the owner"). The executor agent attempts each hypothesis in order:
+- **No meaningful result returned** → accept the outcome and move to the next hypothesis; do not retry.
+- **Hard error (4xx / 5xx from the tool)** → retry that hypothesis once before moving on.
+
+After all 3 hypotheses are attempted (or a confident contact is found), the loop exits. If no contact was found, the row is emitted with `needs_human_review = true`.
+
+### Data flow (per row)
+
 1. Normalize company name + address.
-2. Fan out to each provider in parallel.
-3. Merge results: if multiple sources return the same name/contact → confidence increases; single unverifiable source → confidence stays low.
-4. If confidence < threshold → emit empty contact + `needs_human_review = true`.
-5. Write output row with provenance (`source_url` per field).
+2. Fan out to all lookup tools in parallel (Phase 1).
+3. Aggregate results; run NLP clue extraction.
+4. Agent evaluates sufficiency; if insufficient, run hypothesis loop (Phase 2).
+5. Merge final results: agreement across sources raises confidence; a single unverifiable source keeps it low.
+6. If `confidence_score < threshold` → emit empty contact + `needs_human_review = true`.
+7. Write output row with `source_url` provenance per field.
+
+### Flow diagram
+
+```mermaid
+flowchart TD
+    A([CSV Row\ncompany_name · mailing_address]) --> B[Normalize ETL\nclean name · standardize address]
+
+    B --> C1[Tool 1 · Google Maps\naddress → phone · website · social links]
+    B --> C2[Tool 2 · Web Search\nname variations → website → contact page]
+    B --> C5[Tool 5 · Email Syntax + MX Check\nno live probe sent]
+
+    C1 & C2 --> C3{Tool 3 · LinkedIn Resolution\nWhat kind of profile?}
+    C3 -- Company page --> C4[Tool 4 · LinkedIn Sales Navigator\nsemantic search by title]
+    C3 -- Personal profile --> C3b[Resolve to company page\nvia LinkedIn API + NLP match]
+    C3b --> C4
+
+    C1 & C2 & C4 & C5 --> D[Aggregate Results Table\none entry per signal · each with source_url]
+
+    D --> E[NLP Clue Extraction Agent\ncross-reference signals\ne.g. email → extract name → corroborate]
+
+    E --> F{Orchestrator Agent\nIs data sufficient?}
+
+    F -- Yes --> G[Score Confidence\n0–100 based on source agreement]
+    F -- No  --> H[Generate up to 3 Hypotheses]
+    H --> I{Executor Agent\nRun hypothesis}
+    I -- No result → accept,\nmove to next --> H
+    I -- Hard error 4xx/5xx → retry once --> I
+    I -- All 3 exhausted --> G
+
+    G --> J{confidence ≥ threshold?}
+    J -- Yes --> K[Emit Contact\nname · role · email/phone · provenance]
+    J -- No  --> L[Emit Empty Contact\nneeds_human_review = true]
+
+    K & L --> M([Output CSV Row])
+```
+
+
 
 <!-- GAPS — needs answers before building:
   - What is the execution model? Batch (process all rows at once) or one-at-a-time CLI call?
